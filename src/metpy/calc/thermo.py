@@ -14,13 +14,12 @@ from .tools import (_greater_or_close, _less_or_close, _remove_nans, find_boundi
                     find_intersections, first_derivative, get_layer)
 from .. import constants as mpconsts
 from ..cbook import broadcast_indices
-from ..interpolate.one_dimension import interpolate_1d
+from ..interpolate.one_dimension import interpolate_1d, log_interpolate_1d
 from ..package_tools import Exporter
 from ..units import check_units, concatenate, process_units, units
 from ..xarray import add_vertical_dim_from_xarray, preprocess_and_wrap
-
 exporter = Exporter(globals())
-
+from scipy.optimize import root_scalar
 
 @exporter.export
 @preprocess_and_wrap(wrap_like='temperature', broadcast=('temperature', 'dewpoint'))
@@ -66,7 +65,6 @@ def relative_humidity_from_dewpoint(temperature, dewpoint):
     e = saturation_vapor_pressure(dewpoint)
     e_s = saturation_vapor_pressure(temperature)
     return (e / e_s)
-
 
 @exporter.export
 @preprocess_and_wrap(wrap_like='pressure')
@@ -799,7 +797,7 @@ def el(pressure, temperature, dewpoint, parcel_temperature_profile=None, which='
 @exporter.export
 @preprocess_and_wrap(wrap_like='pressure')
 @check_units('[pressure]', '[temperature]', '[temperature]')
-def parcel_profile(pressure, temperature, dewpoint):
+def parcel_profile(pressure, temperature, dewpoint, z=None, testing=False, Tenv=None, Tdenv=None):
     r"""Calculate the profile a parcel takes through the atmosphere.
 
     The parcel starts at `temperature`, and `dewpoint`, lifted up
@@ -870,7 +868,10 @@ def parcel_profile(pressure, temperature, dewpoint):
        Renamed ``dewpt`` parameter to ``dewpoint``
 
     """
-    _, _, _, t_l, _, t_u = _parcel_profile_helper(pressure, temperature, dewpoint)
+    if not testing:
+        _, _, _, t_l, _, t_u = _parcel_profile_helper(pressure, temperature, dewpoint)
+    else:
+        _, _, _, t_l, _, t_u = _parcel_profile_helper2(pressure, temperature, dewpoint, z, Tenv, Tdenv)
     return concatenate((t_l, t_u))
 
 
@@ -1098,6 +1099,144 @@ def _parcel_profile_helper(pressure, temperature, dewpoint):
     # Return profile pieces
     return (press_lower[:-1], press_lcl, press_upper[1:],
             temp_lower[:-1], temp_lcl, temp_upper[1:])
+
+
+
+def _parcel_profile_helper2(pressure, temperature, dewpoint, z, envtemp, envdewpt):
+    """Help calculate parcel profiles.
+
+    Returns the temperature and pressure, above, below, and including the LCL. The
+    other calculation functions decide what to do with the pieces.
+
+    """
+    # Check that pressure does not increase.
+    if not _check_pressure(pressure):
+        msg = """
+        Pressure increases between at least two points in your sounding.
+        Using scipy.signal.medfilt may fix this."""
+        raise InvalidSoundingError(msg)
+
+    # Find the LCL
+    press_lcl, temp_lcl = lcl(pressure[0], temperature, dewpoint)
+    press_lcl = press_lcl.to(pressure.units)
+    z0 = log_interpolate_1d(press_lcl, pressure, z)[0]
+    print(z0)
+
+    # Find environmental theta e
+    envthetae = equivalent_potential_temperature(pressure, envtemp, envdewpt)
+    thetaeparc = equivalent_potential_temperature(press_lcl, temp_lcl, temp_lcl)
+    # print(thetae)
+    # print(pressure)
+    # print(temperature)
+    #print(dewpoint)
+    #print(thetaeparc)
+    
+    #Incrementally pick out deltaZ and thetae
+    z_parcel = [z0]
+    th_parcel = [thetaeparc]
+    cur_z = z0
+    deltaz = 200*units('m')
+    m0 = 1
+    eps = 0.0002*units('1/m')
+    #eps = 0*units('1/m')
+    while cur_z < 30000*units('m'):
+        halfz = cur_z + deltaz/2
+        m1 = m0 + eps*deltaz
+        envthetaehf = interpolate_1d(halfz, z, envthetae)
+        thetaeparc = (m0*thetaeparc + eps*deltaz*envthetaehf)/(m1)
+        th_parcel.append(thetaeparc)
+        m0=m1
+        cur_z = cur_z + deltaz
+        z_parcel.append(cur_z)
+
+    #print(envthetae)
+    #print(thetaeparc)
+
+
+
+    # Find the dry adiabatic profile, *including* the LCL. We need >= the LCL in case the
+    # LCL is included in the levels. It's slightly redundant in that case, but simplifies
+    # the logic for removing it later.
+    press_lower = concatenate((pressure[pressure >= press_lcl], press_lcl))
+    temp_lower = dry_lapse(press_lower, temperature)
+
+    # If the pressure profile doesn't make it to the lcl, we can stop here
+    if _greater_or_close(np.nanmin(pressure), press_lcl):
+        return (press_lower[:-1], press_lcl, units.Quantity(np.array([]), press_lower.units),
+                temp_lower[:-1], temp_lcl, units.Quantity(np.array([]), temp_lower.units))
+
+    # Establish profile above LCL
+    press_upper = concatenate((press_lcl, pressure[pressure < press_lcl]))
+
+    # Remove duplicate pressure values from remaining profile. Needed for solve_ivp in
+    # moist_lapse. unique will return remaining values sorted ascending.
+    #unique, indices, counts = np.unique(press_upper.m, return_inverse=True, return_counts=True)
+    #unique = units.Quantity(unique, press_upper.units)
+   # if np.any(counts > 1):
+       # warnings.warn(f'Duplicate pressure(s) {unique[counts > 1]:~P} provided. '
+                     # 'Output profile includes duplicate temperatures as a result.')
+
+    # Find moist pseudo-adiabatic profile starting at the LCL, reversing above sorting
+   # temp_upper = moist_lapse(unique[::-1], temp_lower[-1]).to(temp_lower.units)
+   # temp_upper = temp_upper[::-1][indices]
+
+
+
+    def theta_e_to_temp(thetae, p):
+       """Given thetae and p, find temperature"""
+    
+       def objective(T):
+           T1 = T * units('degK')
+           result = saturation_equivalent_potential_temperature(p, T1).m_as('kelvin') - thetae
+           return result
+       if p.m_as('hPa') > 800 or thetae < 310:
+           solution = root_scalar(objective,bracket=(thetae-156,thetae))
+       elif p.m_as('hPa') > 600:
+           solution = root_scalar(objective,bracket=(thetae-160,thetae-10))
+       elif p.m_as('hPa') > 300:
+           solution = root_scalar(objective,bracket=(thetae-170,thetae-25))
+       else:
+           solution = root_scalar(objective,bracket=(1,thetae-65))
+       return solution
+    z_parcel = np.array([z.m for z in z_parcel])*units('m')
+
+    
+
+    #print(z_parcel)
+    #print(z)
+    #print(pressure)
+    
+    logpress_upper = interpolate_1d(z_parcel, z, np.log(pressure.m))
+    newpress_upper = np.exp(logpress_upper)*units('hPa')
+    newtemp_upper = []
+    print(len(newpress_upper))
+    print(len(z_parcel))
+    print(len(th_parcel))
+    for cur_thetae, cur_p in zip(th_parcel, newpress_upper):
+        thetae = cur_thetae.m
+        T = theta_e_to_temp(thetae, cur_p)
+        T = T.root
+        #print(T)
+        newtemp_upper.append(T)
+    newtemp_upper = newtemp_upper*units('degK')
+    
+    temp_upper = interpolate_1d(press_upper, newpress_upper, newtemp_upper)
+
+    #print(newtemp_upper)
+    #print(press_upper)
+    print(newpress_upper[-2:])
+    #print(newtemp_upper)
+    #print(temp_upper)
+    print(th_parcel[-2:])
+    
+    # Return profile pieces
+    return (press_lower[:-1], press_lcl, press_upper[1:],
+            temp_lower[:-1], temp_lcl, temp_upper[1:])
+    
+    
+
+
+
 
 
 def _insert_lcl_level(pressure, temperature, lcl_pressure):
@@ -2858,7 +2997,6 @@ def mixed_parcel(pressure, temperature, dewpoint, parcel_start_pressure=None,
 
     dewpoint : `pint.Quantity`
         Atmospheric dewpoint profile
-
     parcel_start_pressure : `pint.Quantity`, optional
         Pressure at which the mixed parcel should begin (default None)
 
